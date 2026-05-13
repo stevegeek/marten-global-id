@@ -1,0 +1,17 @@
+name: marten_global_id
+version: 0.1.0
+
+authors:
+  - Stephen Ierodiaconou <stevegeek@gmail.com>
+
+crystal: '>= 1.20.1'
+
+license: MIT
+
+dependencies:
+  marten:
+    github: martenframework/marten
+
+development_dependencies:
+  sqlite3:
+    github: crystal-lang/crystal-sqlite3
