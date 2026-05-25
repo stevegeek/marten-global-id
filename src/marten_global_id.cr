@@ -1,5 +1,6 @@
 require "marten"
 require "json"
+require "uri"
 
 require "./marten_global_id/configuration"
 require "./marten_global_id/model_mixin"
@@ -35,8 +36,13 @@ require "./marten_global_id/model_mixin"
 #
 # # 3. Sign + locate:
 # token = book.signed_global_id(purpose: "markdown_upload", expires_in: 1.hour)
-# MartenGlobalId.locate(token, purpose: "markdown_upload")  # => MyApp::Book?
+# MartenGlobalId.locate(token, purpose: "markdown_upload") # => MyApp::Book?
 # ```
+#
+# `purpose:` is required on both `sign` and `locate` — there is no
+# implicit default. Pass `purpose: MartenGlobalId::PURPOSE_DEFAULT` for
+# Rails parity if you really want it. See the README's "Purpose
+# scoping" section.
 #
 # **Confidentiality:** signed tokens are tamper-resistant but **not
 # encrypted** — the `(class, pk, purpose)` triple is recoverable by
@@ -49,8 +55,12 @@ require "./marten_global_id/model_mixin"
 module MartenGlobalId
   VERSION = "0.1.0"
 
-  # Default purpose used when none is supplied. Mirrors Rails'
-  # `SignedGlobalID::DEFAULT_PURPOSE`.
+  # Mirrors Rails' `SignedGlobalID::DEFAULT_PURPOSE`. Available as an
+  # explicit opt-in for callers who want Rails parity — `purpose` is
+  # **required** on `sign` and `locate` (no implicit default) precisely
+  # because issuing or accepting a token without thinking about which
+  # flow it belongs to is a footgun. Pass `purpose: MartenGlobalId::PURPOSE_DEFAULT`
+  # if you really want the Rails default.
   PURPOSE_DEFAULT = "default"
 
   # Raised by `sign` for caller-visible failure modes that aren't
@@ -68,7 +78,8 @@ module MartenGlobalId
   # in the token.
   def self.sign(
     record : Marten::DB::Model,
-    purpose : String = PURPOSE_DEFAULT,
+    *,
+    purpose : String,
     expires_in : Time::Span? = nil,
   ) : String
     pk = record.pk
@@ -76,7 +87,7 @@ module MartenGlobalId
 
     payload = {"c" => record.class.name, "i" => pk.to_s, "p" => purpose}.to_json
     expires = expires_in.try { |span| Time.utc + span }
-    Marten::Core::Signer.new.sign(payload, expires: expires)
+    signer.sign(payload, expires: expires)
   end
 
   # Build the unsigned wire-format string for a record. Equivalent to
@@ -84,34 +95,36 @@ module MartenGlobalId
   # an HMAC. Useful for stable cache keys or comparisons; **not** safe to
   # accept from the outside world. Prefer `sign` for anything that
   # round-trips through user input.
+  #
+  # Wire format: `gid://marten/<url-encoded class name>/<url-encoded pk>`.
+  # Both segments are URL-encoded so the result round-trips through
+  # `URI.parse` even for namespaced classes (`Foo::Bar` -> `Foo%3A%3ABar`)
+  # or pks containing reserved URI characters.
   def self.to_global_id(record : Marten::DB::Model) : String
     pk = record.pk
     raise Error.new("Cannot build a global_id for an unpersisted record (#{record.class.name})") if pk.nil?
 
-    "gid://marten/#{record.class.name}/#{pk}"
+    "gid://marten/#{URI.encode_path_segment(record.class.name)}/#{URI.encode_path_segment(pk.to_s)}"
   end
 
   # Verify + decode a signed token, returning the resolved record (or nil
   # on any failure: bad signature, expired token, malformed payload,
-  # purpose mismatch, class not in the allowlist, record no longer
-  # exists). Mirrors Rails' `GlobalID::Locator.locate_signed`.
+  # purpose mismatch, class not in the allowlist, abstract class in the
+  # allowlist, record no longer exists). Mirrors Rails'
+  # `GlobalID::Locator.locate_signed`.
   #
-  # Documented contract: never raises. Known failure modes from
+  # Documented contract: never raises. All known failure modes from
   # `Marten::Core::Signer#unsign` (`Time::Format::Error` on a malformed
   # `expires` field, `TypeCastError` on a malformed embedded value) are
   # caught and translated to `nil`. Same for `as_s?` on payload fields
   # that are present but not strings.
-  def self.locate(token : String?, purpose : String = PURPOSE_DEFAULT) : Marten::DB::Model?
+  def self.locate(token : String?, *, purpose : String) : Marten::DB::Model?
     return nil if token.nil? || token.empty?
 
     data = safe_unsign(token)
     return nil if data.nil?
 
-    parsed = begin
-      JSON.parse(data).as_h?
-    rescue JSON::ParseException
-      nil
-    end
+    parsed = parse_payload(data)
     return nil if parsed.nil?
 
     # `as_s?` (not `as_s`) so a payload field that is present but not a
@@ -129,7 +142,7 @@ module MartenGlobalId
     klass = resolve_class(class_name)
     return nil if klass.nil?
 
-    klass.get(pk: id_str)
+    safe_get(klass, id_str)
   end
 
   # `Marten::Core::Signer#unsign` only catches `Base64::Error` itself.
@@ -137,15 +150,47 @@ module MartenGlobalId
   # `as_s` on a non-string `_marten.value` both bubble out. Translate
   # the known set to nil so `locate`'s "never raises" contract holds.
   private def self.safe_unsign(token : String) : String?
-    Marten::Core::Signer.new.unsign(token)
+    signer.unsign(token)
   rescue Time::Format::Error | TypeCastError
     nil
+  end
+
+  # `.as_h?` (not `.as_h`) so a non-object top-level JSON value
+  # (`null`, an array, a bare string) collapses to nil rather than
+  # raising `TypeCastError` — same pattern as `as_s?` in `locate`.
+  private def self.parse_payload(data : String) : Hash(String, JSON::Any)?
+    JSON.parse(data).as_h?
+  rescue JSON::ParseException
+    nil
+  end
+
+  # Look the record up by pk. Returns nil on any DB-layer failure so the
+  # locator's "never raises" contract holds — see the bare `rescue`
+  # below.
+  private def self.safe_get(klass : Marten::DB::Model.class, id_str : String) : Marten::DB::Model?
+    klass.get(pk: id_str)
+  rescue
+    nil
+  end
+
+  # Memoised signer. `Marten::Core::Signer.new` is cheap, but reusing
+  # the instance is slightly clearer about the invariant: every call
+  # signs/verifies with the same key.
+  protected def self.signer : Marten::Core::Signer
+    @@signer ||= Marten::Core::Signer.new
   end
 
   # Look up a class by name in the configured allowlist. Returns nil if
   # the name doesn't match any registered class — i.e. the resolver
   # never instantiates a class the host app didn't explicitly opt in.
+  # Abstract classes are skipped (`klass.get` raises on abstract model
+  # classes; we treat that as "not registered").
+  #
+  # Note: the simple `name ==` lookup presumes class names don't collide
+  # under URL-encoding (they shouldn't — Crystal class names are
+  # `[A-Za-z0-9_:]+`), and that the chosen URI separator (`/`) never
+  # appears in a class name.
   private def self.resolve_class(name : String) : Marten::DB::Model.class | Nil
-    Marten.settings.global_id.allowed_classes.find { |klass| klass.name == name }
+    Marten.settings.global_id.allowed_classes.find { |klass| klass.name == name && !klass.abstract? }
   end
 end

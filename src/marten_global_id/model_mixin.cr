@@ -15,13 +15,20 @@ module MartenGlobalId
   # remember to also add the class to `config.global_id.allowed_classes`
   # so the locator will accept tokens that reference it.
   #
+  # **Namespace pollution warning:** including this mixin defines
+  # `global_id` and `signed_global_id` as instance methods on the host
+  # class. Do **not** include `MartenGlobalId::ModelMixin` on a model
+  # that already defines either of those names (e.g. a `global_id`
+  # string field imported from an external system) — the mixin's
+  # methods will shadow the field accessor silently.
+  #
   # ```
-  # class MyApp::Book < Marten::Model
+  # class Book < Marten::Model
   #   include MartenGlobalId::ModelMixin
   # end
   #
-  # book.global_id                                         # => "gid://marten/MyApp::Book/3"
-  # book.signed_global_id(purpose: "markdown_upload")      # => "eyJjI..."
+  # book.global_id                                    # => "gid://marten/Book/3"
+  # book.signed_global_id(purpose: "markdown_upload") # => "eyJjI..."
   # ```
   module ModelMixin
     # Unsigned global id — a stable `(class_name, pk)` URI. Use this for
@@ -36,10 +43,11 @@ module MartenGlobalId
     # `MartenGlobalId.locate(token, purpose: ...)` to resolve back to a
     # record.
     def signed_global_id(
-      purpose : ::String = ::MartenGlobalId::PURPOSE_DEFAULT,
+      *,
+      purpose : ::String,
       expires_in : ::Time::Span? = nil,
     ) : ::String
-      ::MartenGlobalId.sign(self, purpose, expires_in)
+      ::MartenGlobalId.sign(self, purpose: purpose, expires_in: expires_in)
     end
   end
 end

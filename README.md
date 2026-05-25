@@ -75,22 +75,25 @@ end
 Sign on the issuing side:
 
 ```crystal
-token = book.signed_global_id(purpose: "markdown_upload", expires_in: 1.hour)
+token : String = book.signed_global_id(purpose: "markdown_upload", expires_in: 1.hour)
 # => "eyJjI...--abc123..."
 ```
 
 Or the class-method form, if you don't want the mixin:
 
 ```crystal
-token = MartenGlobalId.sign(book, purpose: "markdown_upload", expires_in: 1.hour)
+token : String = MartenGlobalId.sign(book, purpose: "markdown_upload", expires_in: 1.hour)
 ```
 
 Locate on the receiving side:
 
 ```crystal
-MartenGlobalId.locate(token, purpose: "markdown_upload")
-# => Marten::DB::Model? (nil on any rejection)
+record : Marten::DB::Model? = MartenGlobalId.locate(token, purpose: "markdown_upload")
+# => nil on any rejection
 ```
+
+`locate` accepts a `String?` token so handlers can pipe `params["token"]?`
+straight through without an extra nil guard.
 
 The receiving side gets back a `Marten::DB::Model?`. Cast or pattern-match to the concrete class you expect:
 
@@ -105,10 +108,11 @@ end
 
 ### Unsigned global ids
 
-The mixin also exposes `record.global_id` (Rails' `to_global_id`), an *unsigned* `gid://marten/<class>/<pk>` URI. Use it for cache keys or internal comparisons:
+The mixin also exposes `record.global_id` (Rails' `to_global_id`), an *unsigned* `gid://marten/<class>/<pk>` URI. Use it for cache keys or internal comparisons. Both segments are URL-encoded, so namespaced class names round-trip through `URI.parse`:
 
 ```crystal
-book.global_id   # => "gid://marten/MyApp::Book/3"
+book.global_id            # => "gid://marten/MyApp%3A%3ABook/3"
+URI.parse(book.global_id) # => parsable, host="marten", path="/MyApp%3A%3ABook/3"
 ```
 
 **Don't accept unsigned gids from the outside world.** They're not tamper-resistant. Use `signed_global_id` for anything that round-trips through user input.
@@ -123,6 +127,7 @@ book.global_id   # => "gid://marten/MyApp::Book/3"
 4. **Class not in allowlist** — token names a class the host didn't register via `config.global_id.allowed_classes`.
 5. **Record not found** — the record was deleted (or never existed) between sign and locate.
 6. **Malformed payload** — a holder of the signing key hand-built a payload with the wrong shape (e.g. `"i"` is a number, `"p"` is null, the `_marten` `expires` field isn't ISO-8601). Reachable only if the signing key is in the wrong hands; still collapses to `nil` so the contract holds.
+7. **Abstract model class in the allowlist** — included in case a host registers a base model by accident; the class is treated as "not registered".
 
 These all collapse to `nil`. If you need to distinguish expired-vs-invalid for UX (e.g. "this link has expired, request a new one"), you'll need to wrap `MartenGlobalId.sign` / unsign at the call site — out of scope for the shard.
 
@@ -132,7 +137,11 @@ These all collapse to `nil`. If you need to distinguish expired-vs-invalid for U
 
 `purpose:` acts as a domain separator. A token issued for `"markdown_upload"` cannot be redeemed with `purpose: "session_transfer"` even though both use the same signing key. This prevents tokens leaked from one flow being reused in another.
 
-The default purpose is `"default"` — use it for one-flow apps; supply an explicit purpose anywhere there's more than one redemption site.
+`purpose:` is **required** on both `sign` and `locate` — there is no implicit default, because issuing a token without thinking about which flow it belongs to is the canonical way to ship a cross-flow replay bug. Single-flow apps should still pass something meaningful (`purpose: "default"`, `purpose: "<app-name>"`, etc.). The constant `MartenGlobalId::PURPOSE_DEFAULT == "default"` is exposed for callers who want Rails parity:
+
+```crystal
+MartenGlobalId.sign(book, purpose: MartenGlobalId::PURPOSE_DEFAULT)
+```
 
 ## Expiry
 
@@ -164,11 +173,23 @@ If you need confidentiality (the *contents* of the token must stay opaque), don'
 - Issue an opaque server-side token (random bytes, looked up in a database row that owns the `(class, pk, purpose, expires_at)` record) instead. This is what most password-reset / magic-link flows actually want.
 - Pre-encrypt the payload yourself before signing if you must use this shard's wire format.
 
+## Key rotation
+
+`Marten::Core::Signer` takes a single signing key (`Marten.settings.secret_key`). Rotating that key **invalidates every outstanding signed gid in flight** — anything mailed out as a password-reset link, magic link, signed callback URL, etc. will stop verifying the moment the key flips. Plan rotations around the longest-lived token you've issued (the `expires_in` you pass to `sign`):
+
+- If your longest signed-gid TTL is 1 hour, schedule a window where the old key keeps running for at least that long after you mint the last token with it.
+- If you need overlapping-key rotation (Rails' `MessageVerifier#rotate("old_secret")`), this shard doesn't provide it — `Marten::Core::Signer` only knows one key at a time. You'd need to either (a) keep TTLs short enough that "rotate + wait for TTL" is acceptable, or (b) wrap the signer call site to try the old key on `nil` returns during a rotation window.
+
 ## How it works
 
 1. `sign(record, purpose:, expires_in:)` builds a JSON payload `{"c": "<class>", "i": "<pk>", "p": "<purpose>"}`, plus an optional absolute expiry timestamp.
 2. The payload is signed via `Marten::Core::Signer#sign(value, expires:)` — HMAC-SHA256 with Marten's `secret_key`. The signer Base64-encodes the payload and appends an HMAC digest separated by `--`.
 3. `locate(token, purpose:)` unsigns the token (rejecting tampered or expired ones), parses the JSON, verifies the purpose matches, looks up the class name in `config.global_id.allowed_classes`, and (if found) does a regular `klass.get(pk: id)` to materialise the record.
+
+### Wire format
+
+- Signed: `base64(JSON({"c","i","p"}))` (+ an optional `_marten` envelope carrying the expiry timestamp) + `"--"` + `HMAC-SHA256` hex digest.
+- Unsigned (`to_global_id` / `record.global_id`): `gid://marten/<URL-encoded class name>/<URL-encoded pk>`. Both segments are URL-encoded so namespaced class names (`Foo::Bar` -> `Foo%3A%3ABar`) and pks containing reserved URI characters round-trip through `URI.parse`.
 
 ## Relationship to marten-signed-id
 
