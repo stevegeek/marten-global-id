@@ -91,12 +91,76 @@ describe MartenGlobalId do
       Marten.settings.global_id.allowed_classes = [] of Marten::DB::Model.class
       MartenGlobalId.locate(token).should be_nil
     end
+
+    # H1: a hand-crafted payload (only reachable to a holder of the
+    # signing key) whose `i` field is a number rather than a string used
+    # to raise `TypeCastError` instead of returning nil.
+    it "returns nil on a payload whose 'i' field is not a string" do
+      Marten.settings.global_id.allowed_classes = [Widget] of Marten::DB::Model.class
+      payload = %({"c":"Widget","i":3,"p":"default"})
+      forged = Marten::Core::Signer.new.sign(payload, expires: nil)
+      MartenGlobalId.locate(forged).should be_nil
+    end
+
+    it "returns nil on a payload whose 'p' field is null" do
+      Marten.settings.global_id.allowed_classes = [Widget] of Marten::DB::Model.class
+      payload = %({"c":"Widget","i":"1","p":null})
+      forged = Marten::Core::Signer.new.sign(payload, expires: nil)
+      MartenGlobalId.locate(forged).should be_nil
+    end
+
+    it "returns nil on a payload whose 'c' field is a hash" do
+      Marten.settings.global_id.allowed_classes = [Widget] of Marten::DB::Model.class
+      payload = %({"c":{"nested":"value"},"i":"1","p":"default"})
+      forged = Marten::Core::Signer.new.sign(payload, expires: nil)
+      MartenGlobalId.locate(forged).should be_nil
+    end
+
+    # H2: the signer can raise `Time::Format::Error` when the embedded
+    # `_marten.expires` string isn't a valid ISO-8601 timestamp. The
+    # locator must catch that and return nil so the documented "never
+    # raises" contract holds.
+    it "returns nil when the signed payload's expires field is malformed" do
+      Marten.settings.global_id.allowed_classes = [Widget] of Marten::DB::Model.class
+
+      # Manually build a Marten signer envelope with a broken `expires`
+      # string (the signer's `unsign` calls `Time.parse_iso8601` on it).
+      inner = {"c" => "Widget", "i" => "1", "p" => "default"}.to_json
+      envelope = {
+        "_marten" => {
+          "value"   => Base64.strict_encode(inner),
+          "expires" => "this-is-not-a-timestamp",
+        },
+      }.to_json
+      forged = Marten::Core::Signer.new.sign(envelope, expires: nil)
+
+      MartenGlobalId.locate(forged).should be_nil
+    end
+  end
+
+  describe ".sign" do
+    # H2: signing an unsaved record used to raise `NilAssertionError`
+    # from `record.pk!`. Now raises a shard-specific `Error` with a
+    # clearer message.
+    it "raises MartenGlobalId::Error when the record is unpersisted" do
+      widget = Widget.new(name: "not yet saved")
+      expect_raises(MartenGlobalId::Error, /unpersisted/) do
+        MartenGlobalId.sign(widget)
+      end
+    end
   end
 
   describe ".to_global_id" do
     it "produces a stable gid:// URI for a record" do
       widget = Widget.create!(name: "x")
       MartenGlobalId.to_global_id(widget).should eq("gid://marten/Widget/#{widget.pk}")
+    end
+
+    it "raises MartenGlobalId::Error for an unpersisted record" do
+      widget = Widget.new(name: "not yet saved")
+      expect_raises(MartenGlobalId::Error, /unpersisted/) do
+        MartenGlobalId.to_global_id(widget)
+      end
     end
   end
 

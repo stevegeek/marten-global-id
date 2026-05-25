@@ -122,8 +122,11 @@ book.global_id   # => "gid://marten/MyApp::Book/3"
 3. **Purpose mismatch** — token was issued with `purpose: "transfer"`, redeemed with `purpose: "password_reset"`.
 4. **Class not in allowlist** — token names a class the host didn't register via `config.global_id.allowed_classes`.
 5. **Record not found** — the record was deleted (or never existed) between sign and locate.
+6. **Malformed payload** — a holder of the signing key hand-built a payload with the wrong shape (e.g. `"i"` is a number, `"p"` is null, the `_marten` `expires` field isn't ISO-8601). Reachable only if the signing key is in the wrong hands; still collapses to `nil` so the contract holds.
 
 These all collapse to `nil`. If you need to distinguish expired-vs-invalid for UX (e.g. "this link has expired, request a new one"), you'll need to wrap `MartenGlobalId.sign` / unsign at the call site — out of scope for the shard.
+
+**Sign-side errors that are *not* swallowed:** `MartenGlobalId.sign` raises `MartenGlobalId::Error` if you hand it an unpersisted record (there's no stable pk to encode). Same for `MartenGlobalId.to_global_id`. Other than that, both methods only raise if the underlying `Marten::Core::Signer` does (which shouldn't happen with a valid `secret_key`).
 
 ## Purpose scoping
 
@@ -140,6 +143,26 @@ book.signed_global_id(purpose: "markdown_upload", expires_in: 1.hour)
 book.signed_global_id(purpose: "magic_link",      expires_in: 15.minutes)
 book.signed_global_id(purpose: "permanent_token")
 ```
+
+## What's in the token (confidentiality)
+
+Signed tokens are **tamper-resistant, not confidential**. The payload is HMAC-signed but **not encrypted** — any holder of the token can Base64-decode the first half and recover the `(class_name, pk, purpose)` tuple in plaintext:
+
+```
+echo "eyJjI...--abc123..." | cut -d'-' -f1 | base64 -d
+# => {"c":"User","i":"42","p":"password_reset"}
+```
+
+This matches Rails' `SignedGlobalID` and is fine for most uses, but it means **anywhere a signed token can be observed, the encoded record reference is observable too**:
+
+- A signed reset link emailed to a user discloses the user's primary key and the model class name to anyone who reads the email — including any MTA hop in transit, the user's mail client, an attacker who later phishes the mailbox, etc.
+- Browser history, HTTP referrer leaks, web server access logs, third-party analytics that capture URLs — all expose the same data.
+- The `purpose` string is also visible — useful reconnaissance for an attacker (it tells them which flow the token was minted for).
+
+If you need confidentiality (the *contents* of the token must stay opaque), don't use signed gids for the transport. Options:
+
+- Issue an opaque server-side token (random bytes, looked up in a database row that owns the `(class, pk, purpose, expires_at)` record) instead. This is what most password-reset / magic-link flows actually want.
+- Pre-encrypt the payload yourself before signing if you must use this shard's wire format.
 
 ## How it works
 
