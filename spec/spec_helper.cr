@@ -8,8 +8,17 @@ require "marten/spec"
 require "./test_project/app"
 require "./test_project/models/**"
 
+# Fixed spec secret — debuggability over per-run rotation. A failing
+# spec's token can be re-signed by hand from the literal key, which is
+# the cheapest way to triage a HMAC mismatch. Matches sister shard
+# `marten-signed-id`'s `SPEC_SECRET_KEY` for cross-shard consistency.
+# The `before_each` below only resets the allowlist, not the secret;
+# if a future spec wants to verify behaviour under a *rotated* secret
+# it'll need to stash + restore `Marten.settings.secret_key` itself.
+SPEC_SECRET_KEY = "__insecure_spec_secret_DO_NOT_USE__"
+
 Marten.configure :test do |config|
-  config.secret_key = "__insecure_spec_secret_#{Random::Secure.random_bytes(16).hexstring}__"
+  config.secret_key = SPEC_SECRET_KEY
   config.log_level = ::Log::Severity::None
 
   config.installed_apps = [MartenGlobalIdSpecApp]

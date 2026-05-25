@@ -39,9 +39,13 @@ describe MartenGlobalId do
       Marten.settings.global_id.allowed_classes = [Widget] of Marten::DB::Model.class
 
       widget = Widget.create!(name: "Handbook")
-      # Negative span expires the token immediately (the signer compares
-      # against Time.utc on verify).
-      token = MartenGlobalId.sign(widget, purpose: "default", expires_in: -1.second)
+      # Sign with a 1-second expiry, then sleep past it. We used to use
+      # a negative span (immediate expiry) but `sign` now rejects
+      # non-positive `expires_in` as a misuse-by-construction footgun
+      # (MGR-N3); the only way to exercise the expired-token branch
+      # without poking the signer directly is to wait it out.
+      token = MartenGlobalId.sign(widget, purpose: "default", expires_in: 1.second)
+      sleep 1.1.seconds
       MartenGlobalId.locate(token, purpose: "default").should be_nil
     end
 
@@ -157,6 +161,41 @@ describe MartenGlobalId do
       forged = Marten::Core::Signer.new.sign(payload, expires: nil)
       MartenGlobalId.locate(forged, purpose: "default").should be_nil
     end
+
+    # MGR-N1: `Marten::Core::Signer#unsign` uses `dig("_marten", "value")`
+    # / `.as_s` unsafely, so a key-holder can hand-craft three envelope
+    # shapes that bubble exceptions out past the signer. `safe_unsign`
+    # must translate all three to nil so `locate`'s "never raises"
+    # contract holds. (Reachable only by a holder of the signing key,
+    # but a documented contract is a documented contract.)
+
+    it "returns nil on a signed envelope whose _marten hash lacks 'value'/'expires'" do
+      Marten.settings.global_id.allowed_classes = [Widget] of Marten::DB::Model.class
+
+      # `dig("_marten", "value")` raises KeyError here.
+      envelope = {"_marten" => {"unrelated" => "x"}}.to_json
+      forged = Marten::Core::Signer.new.sign(envelope, expires: nil)
+      MartenGlobalId.locate(forged, purpose: "default").should be_nil
+    end
+
+    it "returns nil on a signed envelope with 'value' but no 'expires'" do
+      Marten.settings.global_id.allowed_classes = [Widget] of Marten::DB::Model.class
+
+      inner = {"c" => "Widget", "i" => "1", "p" => "default"}.to_json
+      envelope = {"_marten" => {"value" => Base64.strict_encode(inner)}}.to_json
+      forged = Marten::Core::Signer.new.sign(envelope, expires: nil)
+      MartenGlobalId.locate(forged, purpose: "default").should be_nil
+    end
+
+    it "returns nil on a signed envelope where '_marten' is a string, not a hash" do
+      Marten.settings.global_id.allowed_classes = [Widget] of Marten::DB::Model.class
+
+      # The signer's `parsed_data_hash.dig("_marten", "value")` blows up
+      # because `_marten` isn't a hash — bubbles a bare Exception out.
+      envelope = {"_marten" => "not a hash"}.to_json
+      forged = Marten::Core::Signer.new.sign(envelope, expires: nil)
+      MartenGlobalId.locate(forged, purpose: "default").should be_nil
+    end
   end
 
   describe ".sign" do
@@ -167,6 +206,42 @@ describe MartenGlobalId do
       widget = Widget.new(name: "not yet saved")
       expect_raises(MartenGlobalId::Error, /unpersisted/) do
         MartenGlobalId.sign(widget, purpose: "default")
+      end
+    end
+
+    # MGR-N2: a blank purpose silently used to issue a token redeemable
+    # by any other code path that forgot to interpolate either. Match
+    # sister shard `marten-signed-id` and raise upfront.
+    it "raises ArgumentError when purpose is blank" do
+      widget = Widget.create!(name: "x")
+      expect_raises(ArgumentError, /purpose must be non-blank/) do
+        MartenGlobalId.sign(widget, purpose: "")
+      end
+    end
+
+    # MGR-N3: a negative/zero `expires_in` produces a token expired
+    # the instant it's minted — almost certainly a bug. Use `nil` for
+    # "no expiry" instead.
+    it "raises ArgumentError when expires_in is non-positive" do
+      Marten.settings.global_id.allowed_classes = [Widget] of Marten::DB::Model.class
+      widget = Widget.create!(name: "x")
+
+      expect_raises(ArgumentError, /expires_in must be positive/) do
+        MartenGlobalId.sign(widget, purpose: "default", expires_in: -1.hour)
+      end
+      expect_raises(ArgumentError, /expires_in must be positive/) do
+        MartenGlobalId.sign(widget, purpose: "default", expires_in: 0.seconds)
+      end
+    end
+  end
+
+  describe ".locate" do
+    # MGR-N2: matching sister shard. A blank purpose on the verify side
+    # is just as suspicious as on the sign side — likely a forgotten
+    # interpolation in caller code.
+    it "raises ArgumentError when purpose is blank" do
+      expect_raises(ArgumentError, /purpose must be non-blank/) do
+        MartenGlobalId.locate("any-token", purpose: "")
       end
     end
   end
@@ -224,7 +299,10 @@ describe MartenGlobalId do
       Marten.settings.global_id.allowed_classes = [Widget] of Marten::DB::Model.class
 
       widget = Widget.create!(name: "T")
-      token = widget.signed_global_id(purpose: "test", expires_in: -1.minute)
+      # 1-second expiry + sleep, same shape as the top-level expired
+      # token spec (negative spans are now rejected upfront — MGR-N3).
+      token = widget.signed_global_id(purpose: "test", expires_in: 1.second)
+      sleep 1.1.seconds
       MartenGlobalId.locate(token, purpose: "test").should be_nil
     end
   end

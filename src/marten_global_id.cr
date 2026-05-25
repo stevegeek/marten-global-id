@@ -76,12 +76,24 @@ module MartenGlobalId
   # Raises `MartenGlobalId::Error` if `record` has not been persisted
   # (i.e. `record.pk` is `nil`) — there is no stable identifier to put
   # in the token.
+  #
+  # Raises `ArgumentError` if `purpose` is blank (a forgotten
+  # interpolation would otherwise produce a token redeemable by any
+  # other code path that also forgot — same footgun as the implicit
+  # default purpose). Matches sister shard `marten-signed-id`.
+  #
+  # Raises `ArgumentError` if `expires_in` is non-positive — a negative
+  # or zero expiry produces a token that's expired the instant it's
+  # minted, which is almost certainly a bug. Use `nil` for "no expiry".
   def self.sign(
     record : Marten::DB::Model,
     *,
     purpose : String,
     expires_in : Time::Span? = nil,
   ) : String
+    raise ArgumentError.new("purpose must be non-blank") if purpose.blank?
+    raise ArgumentError.new("expires_in must be positive") if expires_in && !expires_in.positive?
+
     pk = record.pk
     raise Error.new("Cannot sign an unpersisted record (#{record.class.name})") if pk.nil?
 
@@ -119,6 +131,7 @@ module MartenGlobalId
   # caught and translated to `nil`. Same for `as_s?` on payload fields
   # that are present but not strings.
   def self.locate(token : String?, *, purpose : String) : Marten::DB::Model?
+    raise ArgumentError.new("purpose must be non-blank") if purpose.blank?
     return nil if token.nil? || token.empty?
 
     data = safe_unsign(token)
@@ -146,12 +159,28 @@ module MartenGlobalId
   end
 
   # `Marten::Core::Signer#unsign` only catches `Base64::Error` itself.
-  # `Time.parse_iso8601` on a malformed `_marten.expires` field and
-  # `as_s` on a non-string `_marten.value` both bubble out. Translate
-  # the known set to nil so `locate`'s "never raises" contract holds.
+  # A holder of the signing key can hand-craft envelope shapes the
+  # signer wasn't written defensively against, and they bubble out as:
+  #
+  #   * `Time::Format::Error` — `_marten.expires` isn't ISO-8601
+  #   * `TypeCastError` — `_marten` is present but not a hash, or its
+  #     `value` field isn't a string (`dig(...).as_s` in the signer)
+  #   * `KeyError` — `_marten` hash is missing `value` or `expires`
+  #     (`dig("_marten", "value")` raises)
+  #
+  # We translate the known set explicitly. `InvalidSignatureError` is
+  # listed defensively: `unsign` returns nil on a bad signature today
+  # (only `unsign!` raises), but the contract has flipped before and
+  # `locate`'s "never raises" promise shouldn't depend on which side it
+  # lands on next. A final unanticipated-`Exception` rescue keeps the
+  # contract intact and surfaces the shape via `Marten::Log.debug` so
+  # we notice rather than silently swallow.
   private def self.safe_unsign(token : String) : String?
     signer.unsign(token)
-  rescue Time::Format::Error | TypeCastError
+  rescue Time::Format::Error | TypeCastError | KeyError | Marten::Core::Signer::InvalidSignatureError
+    nil
+  rescue ex
+    Marten::Log.debug(exception: ex) { "Unexpected error in MartenGlobalId.safe_unsign: #{ex.message}" }
     nil
   end
 
@@ -164,12 +193,24 @@ module MartenGlobalId
     nil
   end
 
-  # Look the record up by pk. Returns nil on any DB-layer failure so the
-  # locator's "never raises" contract holds — see the bare `rescue`
-  # below.
+  # Translate the documented "no such record" path to nil while still
+  # surfacing genuine failures (DB connection drop, malformed query,
+  # etc.) via `Marten::Log.debug`. The bare `rescue` this used to be
+  # made a connection failure indistinguishable from "record not found"
+  # to the caller; logging keeps the documented "locate returns nil on
+  # any failure" contract intact but leaves diagnostics for operators.
+  #
+  # `resolve_class` already filters abstract classes out, so the
+  # historical "abstract model class raises from .get" path is dead;
+  # the bare rescue's other only consumer was that path.
   private def self.safe_get(klass : Marten::DB::Model.class, id_str : String) : Marten::DB::Model?
     klass.get(pk: id_str)
-  rescue
+  rescue Marten::DB::Errors::RecordNotFound
+    nil
+  rescue ex
+    Marten::Log.debug(exception: ex) do
+      "Unexpected error in MartenGlobalId.locate(#{klass.name}, pk: #{id_str}): #{ex.message}"
+    end
     nil
   end
 
