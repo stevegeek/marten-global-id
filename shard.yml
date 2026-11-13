@@ -8,6 +8,10 @@ crystal: '>= 1.20.1'
 
 license: MIT
 
+targets:
+  ameba:
+    main: lib/ameba/bin/ameba.cr
+
 dependencies:
   marten:
     github: martenframework/marten
@@ -15,3 +19,6 @@ dependencies:
 development_dependencies:
   sqlite3:
     github: crystal-lang/crystal-sqlite3
+  ameba:
+    github: crystal-ameba/ameba
+    version: ~> 1.7.0
