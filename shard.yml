@@ -15,6 +15,7 @@ targets:
 dependencies:
   marten:
     github: martenframework/marten
+    version: ">= 0.2.0"
 
 development_dependencies:
   sqlite3:

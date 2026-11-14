@@ -5,8 +5,8 @@ require "sqlite3"
 require "../src/marten_global_id"
 require "marten/spec"
 
-require "./test_project/app"
-require "./test_project/models/**"
+require "./support/test_project/app"
+require "./support/test_project/models/**"
 
 # Fixed spec secret — debuggability over per-run rotation. A failing
 # spec's token can be re-signed by hand from the literal key, which is
