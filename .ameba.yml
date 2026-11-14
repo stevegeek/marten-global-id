@@ -5,3 +5,9 @@ Naming/BlockParameterName:
 Lint/NotNil:
   Excluded:
     - spec/**
+
+# spec/test_project holds the Marten app and models the specs load, not
+# specs; a _spec suffix would make `crystal spec` run them as specs.
+Lint/SpecFilename:
+  Excluded:
+    - spec/test_project/**/*.cr

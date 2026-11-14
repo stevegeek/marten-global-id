@@ -132,13 +132,13 @@ module MartenGlobalId
   # that are present but not strings.
   def self.locate(token : String?, *, purpose : String) : Marten::DB::Model?
     raise ArgumentError.new("purpose must be non-blank") if purpose.blank?
-    return nil if token.nil? || token.empty?
+    return if token.nil? || token.empty?
 
     data = safe_unsign(token)
-    return nil if data.nil?
+    return if data.nil?
 
     parsed = parse_payload(data)
-    return nil if parsed.nil?
+    return if parsed.nil?
 
     # `as_s?` (not `as_s`) so a payload field that is present but not a
     # string — e.g. `"i": 3` instead of `"i": "3"`, or `"p": null` —
@@ -146,14 +146,14 @@ module MartenGlobalId
     # has already authenticated the payload, so this only fires for
     # tokens that the holder of the key built by hand with the wrong
     # shape.
-    return nil unless parsed["p"]?.try(&.as_s?) == purpose
+    return unless parsed["p"]?.try(&.as_s?) == purpose
 
     class_name = parsed["c"]?.try(&.as_s?)
     id_str = parsed["i"]?.try(&.as_s?)
-    return nil if class_name.nil? || id_str.nil?
+    return if class_name.nil? || id_str.nil?
 
     klass = resolve_class(class_name)
-    return nil if klass.nil?
+    return if klass.nil?
 
     safe_get(klass, id_str)
   end
